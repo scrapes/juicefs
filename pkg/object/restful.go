@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -27,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/viki-org/dnscache"
@@ -35,7 +37,50 @@ import (
 var resolver = dnscache.New(time.Minute)
 var httpClient *http.Client
 
+func splitIPsByVersion(ips []net.IP) ([]net.IP, []net.IP) {
+	ipv6 := make([]net.IP, 0, len(ips))
+	ipv4 := make([]net.IP, 0, len(ips))
+	for _, ip := range ips {
+		if ip.To4() == nil {
+			ipv6 = append(ipv6, ip)
+		} else {
+			ipv4 = append(ipv4, ip)
+		}
+	}
+	return ipv6, ipv4
+}
+
+func dialFromRandomPool(ctx context.Context, dialer *net.Dialer, network, port string, ips []net.IP) (net.Conn, error) {
+	n := len(ips)
+	if n == 0 {
+		return nil, fmt.Errorf("empty IP pool")
+	}
+	first := rand.Intn(n)
+	var conn net.Conn
+	var err error
+	for i := 0; i < n; i++ {
+		ip := ips[(first+i)%n]
+		conn, err = dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		if isNoRouteError(err) {
+			return nil, err
+		}
+	}
+	return nil, err
+}
+
+func isNoRouteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, syscall.ENETUNREACH)
+}
+
 func init() {
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+
 	httpClient = &http.Client{
 		Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
@@ -46,32 +91,36 @@ func init() {
 			ReadBufferSize:        32 << 10,
 			WriteBufferSize:       32 << 10,
 			DialContext: func(ctx context.Context, network string, address string) (net.Conn, error) {
-				separator := strings.LastIndex(address, ":")
-				host := address[:separator]
-				port := address[separator:]
+				host, port, err := net.SplitHostPort(address)
+				if err != nil {
+					return nil, err
+				}
+				if ip := net.ParseIP(host); ip != nil {
+					return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+				}
+
 				ips, err := resolver.Fetch(host)
 				if err != nil {
 					return nil, err
 				}
-				if len(ips) == 0 {
-					return nil, fmt.Errorf("No such host: %s", host)
-				}
-				var conn net.Conn
-				n := len(ips)
-				first := rand.Intn(n)
-				dialer := &net.Dialer{Timeout: time.Second * 10}
-				for i := 0; i < n; i++ {
-					ip := ips[(first+i)%n]
-					address = ip.String()
-					if port != "" {
-						address = net.JoinHostPort(address, port[1:])
-					}
-					conn, err = dialer.DialContext(ctx, network, address)
+
+				ipv6, ipv4 := splitIPsByVersion(ips)
+
+				if len(ipv6) > 0 {
+					v6Conn, err := dialFromRandomPool(ctx, dialer, network, port, ipv6)
 					if err == nil {
-						return conn, nil
+						return v6Conn, nil
+					}
+					if len(ipv4) == 0 {
+						return nil, err
 					}
 				}
-				return nil, err
+
+				if len(ipv4) > 0 {
+					return dialFromRandomPool(ctx, dialer, network, port, ipv4)
+				}
+
+				return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 			},
 			DisableCompression: true,
 			TLSClientConfig:    &tls.Config{},
