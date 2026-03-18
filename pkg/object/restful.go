@@ -19,6 +19,7 @@ package object
 import (
 	"bytes"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -26,6 +27,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/viki-org/dnscache"
@@ -49,6 +51,9 @@ func splitIPsByVersion(ips []net.IP) ([]net.IP, []net.IP) {
 
 func dialFromRandomPool(dialer *net.Dialer, network, port string, ips []net.IP) (net.Conn, error) {
 	n := len(ips)
+	if n == 0 {
+		return nil, fmt.Errorf("empty IP pool")
+	}
 	first := rand.Intn(n)
 	var conn net.Conn
 	var err error
@@ -58,12 +63,28 @@ func dialFromRandomPool(dialer *net.Dialer, network, port string, ips []net.IP) 
 		if err == nil {
 			return conn, nil
 		}
+		if isNoRouteError(err) {
+			return nil, err
+		}
 	}
 	return nil, err
 }
 
+func isNoRouteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// net.Dial/Dialer error wrapping is not well documented across platforms;
+	// rely on canonical errno checks.
+	if errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) {
+		return true
+	}
+	return false
+}
+
 func init() {
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
+
 	httpClient = &http.Client{
 		Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
@@ -91,9 +112,25 @@ func init() {
 				}
 				ipv6, ipv4 := splitIPsByVersion(ips)
 				if len(ipv6) > 0 {
-					return dialFromRandomPool(dialer, network, port, ipv6)
+					v6Conn, v6Err := dialFromRandomPool(dialer, network, port, ipv6)
+					if v6Err == nil {
+						return v6Conn, nil
+					}
+					if len(ipv4) > 0 {
+						v4Conn, v4Err := dialFromRandomPool(dialer, network, port, ipv4)
+						if v4Err == nil {
+							return v4Conn, nil
+						}
+						return nil, fmt.Errorf("IPv6 pool failed: %v; IPv4 pool failed: %w", v6Err, v4Err)
+					}
+					return nil, fmt.Errorf("IPv6 pool failed and no IPv4 address for host: %s: %w", host, v6Err)
 				}
-				return dialFromRandomPool(dialer, network, port, ipv4)
+
+				if len(ipv4) > 0 {
+					return dialFromRandomPool(dialer, network, port, ipv4)
+				}
+
+				return nil, fmt.Errorf("no usable address for host: %s", host)
 			},
 			DisableCompression: true,
 			TLSClientConfig:    &tls.Config{},
